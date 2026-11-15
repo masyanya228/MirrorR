@@ -222,13 +222,21 @@ void clearDirs() { expDir[0] = expDir[1] = 0; }
 
 void beginAxis(uint8_t ax) { ref[ax] = startVal[ax] = cur[ax]; }
 
+// Сглаживание: новое = (старое*(K-1) + замер) / K. Значение хранится в 10 бит:
+// в 8 битах целочисленное деление не даёт ему расти на малые шаги.
+const uint8_t SMOOTH_K = 10;
+
 bool readPots(uint8_t *val) {
+  static uint16_t sm[2];
+  static bool primed = false;
   uint16_t r[2] = { (uint16_t)analogRead(PIN_POT_V), (uint16_t)analogRead(PIN_POT_H) };
   bool ok = true;
   for (uint8_t i = 0; i < 2; i++) {
-    if (r[i] < RAW_MIN || r[i] > RAW_MAX) ok = false;
-    val[i] = r[i] >> 2;
+    if (r[i] < RAW_MIN || r[i] > RAW_MAX) ok = false;   // диапазон по несглаженному замеру
+    sm[i] = primed ? (sm[i] * (SMOOTH_K - 1) + r[i]) / SMOOTH_K : r[i];
+    val[i] = sm[i] >> 2;
   }
+  primed = true;
   return ok;
 }
 
@@ -482,12 +490,17 @@ void mcpModify(uint8_t addr, uint8_t mask, uint8_t data) {
   SPI.endTransaction();
 }
 
-// 0x30: бит 0 - зеркало в движении, бит 1 - авария потенциометров, бит 2 - недостоверные данные шины
+// 0x30: бит 0 - зеркало в движении, бит 1 - авария потенциометров, бит 2 - недостоверный M,
+// бит 3 - недостоверная команда от L; байт 2 - счётчик кадра
+uint8_t txCnt = 0;
+
 void sendStatus() {
   uint8_t buf[8] = {0};
   if (motorActive)      buf[0] |= 0x01;
   if (fault)            buf[0] |= 0x02;
-  if (cmdBad || mLost)  buf[0] |= 0x04;
+  if (mLost)            buf[0] |= 0x04;
+  if (cmdBad)           buf[0] |= 0x08;
+  buf[COUNTER_BYTE] = txCnt++;
   mcpModify(REG_CANCTRL, 0x10, 0x10);   // abort TX
   mcpModify(REG_CANCTRL, 0x10, 0x00);
   CAN1.sendMsgBuf(TX_ID, 0, 8, buf);
@@ -600,6 +613,10 @@ void runFsm(unsigned long now) {
         stallRefVal = cur[autoAx];
         stallT = now;
       } else if (now - stallT >= STALL_MS) {
+        Serial.print(F("STALL ax="));  Serial.print(autoAx);
+        Serial.print(F(" start="));    Serial.print(startVal[autoAx]);
+        Serial.print(F(" cur="));      Serial.print(cur[autoAx]);
+        Serial.print(F(" tgt="));      Serial.println(tgt[autoAx]);
         enterFault(C_STALL, now);
       }
     }
