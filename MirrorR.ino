@@ -517,8 +517,11 @@ void runFsm(unsigned long now) {
   bool cmdAny     = (cmdAxis >= 0);     // допустимая команда направления от L
 
   // сохранение M1/M2 по фронту
+  // SAVE запрещён во время автодвижения (фронт при этом не запоминается)
+  if (!isGoto()) {
   if (mSAVE1 && !pSave1) saveCurrent(S_M1);
   if (mSAVE2 && !pSave2) saveCurrent(S_M2);
+  }
 
   // 1. команда направления имеет высший приоритет: прерывает автодвижение всегда,
   //    но двигает зеркало только при разрешении
@@ -567,27 +570,25 @@ void runFsm(unsigned long now) {
           if (isValid(S_MR)) startAuto(ST_GOTO_MR, S_MR);
         } else if (rFall && !linkLostNow) {
           if (isValid(S_LAST)) startAuto(ST_GOTO_LAST, S_LAST);
-        } else if (mSel >= 0) {
-          if (mR) copyToLast(mSel);
-          else if (perm && isValid(mSel)) startAuto(ST_GOTO_M, mSel);
+        } else if (mSel >= 0 && mP && !mR && isValid(mSel)) {   // M1/M2 только в P
+          startAuto(ST_GOTO_M, mSel);
         }
         break;
 
       case ST_GOTO_MR:
         if (rFall) goLast();
-        else if (mSel >= 0) copyToLast(mSel);
         break;
 
       case ST_GOTO_M:
         if (permLost || linkLostNow) goLast();
         else if (rRise) { if (isValid(S_MR)) startAuto(ST_GOTO_MR, S_MR); }
         else if (cancelRise) { clearDirs(); autoAx = -1; st = ST_IDLE; }
-        else if (mSel >= 0 && mSel != autoSlot && isValid(mSel)) startAuto(ST_GOTO_M, mSel);
+        else if (mSel >= 0 && mP && mSel != autoSlot && isValid(mSel)) startAuto(ST_GOTO_M, mSel);
         break;
 
       case ST_GOTO_LAST:
         if (rRise) { if (isValid(S_MR)) startAuto(ST_GOTO_MR, S_MR); }
-        else if (mSel >= 0 && !mR && perm && isValid(mSel)) startAuto(ST_GOTO_M, mSel);
+        else if (mSel >= 0 && mP && !mR && isValid(mSel)) startAuto(ST_GOTO_M, mSel);
         break;
 
       default: break;
