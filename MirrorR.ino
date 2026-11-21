@@ -17,6 +17,8 @@
 #define M_ID          0x10UL   // от M
 #define CMD_ID        0x20UL   // от L
 #define TX_ID         0x30UL   // статус R
+#define DIAG_CMD_ID   0x99UL   // от M: самодиагностика
+#define DIAG_TX_ID    0x97UL   // результаты самодиагностики (этапы 3,4)
 #define TX_PERIOD_MS  50
 #define MCP_BITMOD    0x05
 #define REG_CANCTRL   0x0F
@@ -343,6 +345,124 @@ void applyCmdDirs() {
   }
 }
 
+// ===================== самодиагностика =====================
+// M -> L, R: 0x99, байт 0: бит 0 - режим включён, биты 1..2 - этап (0..3).
+// Пока приходит 0x99, R игнорирует 0x10, отключает автоматику, аварии и запись в EEPROM;
+// правое зеркало двигается по командам направления от L (0x20).
+// R -> M, ID 0x97 (на всех этапах), DLC 4:
+//   байт 0: бит 0 ошибка распознавания команд из CAN (защёлка), биты 1..4 было движение
+//           (Left, Right, Up, Down; накапливается за этап), бит 5 таймаут 0x20 (защёлка),
+//           бит 6 знак потенциометра H (1 = растёт при движении вправо),
+//           бит 7 знак потенциометра V (1 = растёт при движении вверх)
+//   байт 1: сдвиг потенциометра H (int8, пик с макс. модулем от базы этапа)
+//   байт 2: сдвиг потенциометра V (int8, то же), байт 3: счётчик кадра
+const unsigned long DIAG_TIMEOUT_MS = 500;   // нет 0x99 дольше этого времени - выход из режима
+
+bool diagActive = false;
+uint8_t diagStage = 0;
+unsigned long lastRx99 = 0;
+uint8_t dDirs = 0;     // бит 0 Left, 1 Right, 2 Up, 3 Down
+bool dErr = false;
+bool dTimeout = false; // пропажа 0x20
+uint8_t dBase[2] = { 0, 0 };
+int8_t dPeak[2] = { 0, 0 };
+uint8_t diagCnt = 0;
+int8_t dAx = -1;       // текущая ось движения в диагностике
+bool dFwd = false, dLock = false;
+unsigned long dStart = 0;
+
+void diagReset(uint8_t stage) {
+  diagStage = stage;
+  dDirs = 0;
+  dErr = false;
+  dTimeout = false;
+  for (uint8_t ax = 0; ax < 2; ax++) { dBase[ax] = cur[ax]; dPeak[ax] = 0; }
+  Serial.print(F("DIAG stage ")); Serial.println(stage + 1);
+}
+
+void diagEnter(uint8_t stage) {
+  flushSave();
+  StopMotor();
+  motorActive = false;
+  st = ST_IDLE;
+  clearDirs();
+  autoAx = -1;
+  savePending = false;
+  touched = false;
+  cmdSuccess = false;
+  resetPermissions();  // mP = true, остальные флаги M сброшены
+  mLost = false;
+  linkDown = false;
+  dAx = -1;
+  dLock = false;
+  diagActive = true;
+  Serial.println(F("DIAG on"));
+  diagReset(stage);
+}
+
+void diagExit() {
+  diagActive = false;
+  StopMotor();
+  motorActive = false;
+  st = ST_IDLE;
+  clearDirs();
+  autoAx = -1;
+  savePending = false;
+  touched = false;
+  cmdSuccess = false;
+  goodOn = false;
+  resetPermissions();
+  pR = pM1 = pM2 = pCancel = pSave1 = pSave2 = false;
+  prevPerm = true;
+  haveRx = false;
+  linkDown = false;
+  linkLostNow = false;
+  mLost = false;
+  lastRx_M = millis();
+  Serial.println(F("DIAG off"));
+}
+
+void diagOnCmd(uint8_t b) {
+  lastRx99 = millis();
+  if (!(b & 1)) { if (diagActive) diagExit(); return; }
+  uint8_t stage = (b >> 1) & 0x03;
+  if (!diagActive) diagEnter(stage);
+  else if (stage != diagStage) diagReset(stage);
+}
+
+// Движение правого зеркала по командам L без аварий и автоматики, с ограничением по времени
+void diagStep(unsigned long now) {
+  int8_t ax = cmdAxis;
+  bool fwd = cmdFwd;
+  if (ax != dAx || (ax >= 0 && fwd != dFwd)) {
+    dAx = ax; dFwd = fwd; dStart = now; dLock = false;
+  }
+  if (ax >= 0 && !dLock && now - dStart >= AUTO_TIMEOUT_MS) dLock = true;
+  if (dLock) ax = -1;
+
+  motorActive = (ax >= 0);
+  if (ax == AX_V) MoveVertical(fwd);
+  else if (ax == AX_H) MoveHorizontal(fwd);
+  else StopMotor();
+}
+
+void diagTrack(const uint8_t *v) {
+  for (uint8_t ax = 0; ax < 2; ax++) {
+    int16_t dl = (int16_t)v[ax] - dBase[ax];
+    if (abs(dl) > abs((int16_t)dPeak[ax])) dPeak[ax] = (int8_t)constrain(dl, -127, 127);
+  }
+}
+
+void sendDiag() {
+  uint8_t b[4];
+  b[0] = (dErr ? 0x01 : 0) | (uint8_t)(dDirs << 1)
+         | (dTimeout ? 0x20 : 0) | (SIGN_H > 0 ? 0x40 : 0) | (SIGN_V > 0 ? 0x80 : 0);
+  b[1] = (uint8_t)dPeak[AX_H];
+  b[2] = (uint8_t)dPeak[AX_V];
+  b[3] = diagCnt++;
+  CAN1.sendMsgBuf(DIAG_TX_ID, 0, 4, b);
+}
+
 // Опрос потенциометров: диапазон, направление, скорость, штрафные очки, сброс аварии
 void sampleSensors(unsigned long now) {
   if (now - lastSens < SENS_MS) return;
@@ -350,6 +470,14 @@ void sampleSensors(unsigned long now) {
 
   uint8_t v[2];
   bool ok = readPots(v);
+
+  if (diagActive) {  // диагностика: только измерение, без контроля и аварий
+    for (uint8_t ax = 0; ax < 2; ax++) { prevVal[ax] = v[ax]; cur[ax] = v[ax]; }
+    rangeOk = ok;
+    diagTrack(v);
+    return;
+  }
+
   uint8_t why = ok ? 0 : C_RANGE;
 
   if (motorActive) {
@@ -456,6 +584,11 @@ void parseCmd(uint8_t len, const uint8_t *d) {
     default:   ok = false; break;               // несколько битов сразу
   }
 
+  if (diagActive) {
+    if (!ok) dErr = true;                       // недопустимая комбинация битов направления
+    if (ok && ax >= 0) dDirs |= (ax == AX_V) ? (fwd ? 0x04 : 0x08) : (fwd ? 0x02 : 0x01);
+  }
+
   if (ok) {
     if (ax != cmdAxis || (ax >= 0 && fwd != cmdFwd)) {
       Serial.print(F("CMD "));
@@ -475,7 +608,8 @@ void parseCmd(uint8_t len, const uint8_t *d) {
 }
 
 void parseFrame(uint32_t id, uint8_t len, const uint8_t *d) {
-  if (id == M_ID) parseM(len, d);
+  if (id == DIAG_CMD_ID && len >= 1) { diagOnCmd(d[0]); return; }
+  if (id == M_ID) { if (!diagActive) parseM(len, d); }   // в диагностике 0x10 игнорируется
   else if (id == CMD_ID) parseCmd(len, d);
 }
 
@@ -677,8 +811,11 @@ void loop() {
     if (canOk) Serial.println(F("CAN1 ok"));
   }
 
+  // выход из диагностики при пропаже 0x99
+  if (diagActive && now - lastRx99 > DIAG_TIMEOUT_MS) diagExit();
+
   // потеря 0x10 (только если хоть один пакет уже был)
-  if (haveRx && !linkDown && now - lastRx_M > M_TIMEOUT_MS) {
+  if (!diagActive && haveRx && !linkDown && now - lastRx_M > M_TIMEOUT_MS) {
     linkDown = true;
     linkLostNow = true;
     mLost = true;
@@ -688,6 +825,7 @@ void loop() {
   // потеря 0x20: команда сбрасывается, данные недостоверны
   if (now - lastRx_L > CMD_TIMEOUT_MS) {
     if (!cmdBad) Serial.println(F("CMD timeout"));
+    if (diagActive) dTimeout = true;
     cmdAxis = -1;
     cmdBad = true;
   }
@@ -707,11 +845,16 @@ void loop() {
   }
 
   sampleSensors(now);
+  if (diagActive) {
+    diagStep(now);
+  } else {
   runFsm(now);
   driveMotor();
+  }
 
   if (canOk && now - lastTx >= TX_PERIOD_MS) {
     lastTx += TX_PERIOD_MS;
     sendStatus();
+    if (diagActive) sendDiag();
   }
 }
