@@ -23,8 +23,8 @@
 #define MCP_BITMOD    0x05
 #define REG_CANCTRL   0x0F
 
-#define PIN_POT_V     A6
-#define PIN_POT_H     A7
+#define PIN_POT_V     A7
+#define PIN_POT_H     A6
 
 MCP_CAN CAN1(CS1);
 
@@ -54,7 +54,7 @@ const uint8_t  COUNTER_BYTE      = 2;     // счётчик кадра (0x10 и 
 const bool     CHECK_CMD_COUNTER = true;  // проверка счётчика в 0x20
 
 // MoveVertical(true) / MoveHorizontal(true): показание потенциометра растёт, если SIGN = +1
-const int8_t SIGN_V = +1;          // true = UP
+const int8_t SIGN_V = -1;          // true = UP
 const int8_t SIGN_H = +1;          // true = RIGHT
 
 // ===================== типы =====================
@@ -70,7 +70,7 @@ const uint8_t AX_V = 0, AX_H = 1;
 // Пины 4..7 = PD4..PD7: состояние пишется одной операцией в порт,
 // режим хранится в одной переменной, поэтому два мотора одновременно включить нельзя.
 //                                   STOP  V_FWD V_REV H_FWD H_REV
-const uint8_t MOTOR_BITS[5] =      { 0x00, 0x20, 0xD0, 0x40, 0xB0 };
+const uint8_t MOTOR_BITS[5] =      { 0x00, 0x90, 0x60, 0x20, 0xD0 };
 Motor motorMode = M_STOP;
 bool  motorActive = false;
 
